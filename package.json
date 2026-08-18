@@ -1,0 +1,9 @@
+{
+  "name": "remote-play",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "sender": "node sender.js",
+    "check": "node --check server.js && node --check sender.js"
+  }
+}

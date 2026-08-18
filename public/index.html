@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RemotePlay</title>
+  <style>
+    * { box-sizing: border-box }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #101114; color: #f4f4f5; font: 18px system-ui, sans-serif }
+    main { width: min(900px, 92vw); text-align: center }
+    button { border: 0; border-radius: 12px; padding: 14px 22px; font: inherit; font-weight: 650; cursor: pointer; background: #67e8f9; color: #083344 }
+    #fullscreen { margin-top: 16px }
+    video { display: none; width: 100%; max-height: 82vh; margin-top: 20px; background: #000; border-radius: 12px }
+    .muted { color: #a1a1aa; font-size: 15px }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>RemotePlay</h1>
+    <p id="status">Подключение…</p>
+    <button id="start" hidden>Начать трансляцию</button>
+    <button id="cast" hidden>Выбрать телевизор</button>
+    <video id="video" autoplay playsinline></video>
+    <button id="fullscreen" hidden>На весь экран</button>
+    <p class="muted" id="hint"></p>
+  </main>
+  <script>
+    const isSender = ['localhost', '127.0.0.1', '::1'].includes(location.hostname);
+    const status = document.querySelector('#status');
+    const start = document.querySelector('#start');
+    const cast = document.querySelector('#cast');
+    const video = document.querySelector('#video');
+    const fullscreen = document.querySelector('#fullscreen');
+    const hint = document.querySelector('#hint');
+    const id = isSender ? 'sender' : `viewer-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const peers = new Map();
+    let stream;
+    let tvAddress = '';
+    let token = new URLSearchParams(location.search).get('token');
+
+    async function api(path, options) {
+      const separator = path.includes('?') ? '&' : '?';
+      const response = await fetch(`${path}${separator}token=${encodeURIComponent(token)}`, options);
+      if (!response.ok) throw new Error((await response.json()).error || 'Ошибка сети');
+      return response.json();
+    }
+
+    async function send(to, type, payload = {}) {
+      await api('/api/send', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ from: id, to, type, payload }) });
+    }
+
+    function peer(remoteId) {
+      const pc = new RTCPeerConnection();
+      pc.onicecandidate = event => event.candidate && send(remoteId, 'ice', event.candidate);
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === 'connected') status.textContent = isSender ? 'Трансляция идёт' : 'Подключено';
+        if (['failed', 'closed'].includes(pc.connectionState)) peers.delete(remoteId);
+      };
+      peers.set(remoteId, pc);
+      return pc;
+    }
+
+    async function handle(message) {
+      if (isSender && message.type === 'join' && stream) {
+        peers.get(message.from)?.close();
+        const pc = peer(message.from);
+        stream.getTracks().forEach(track => pc.addTrack(track, stream));
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        await send(message.from, 'offer', offer);
+      } else if (!isSender && message.type === 'offer') {
+        const pc = peers.get(message.from) || peer(message.from);
+        pc.ontrack = event => {
+          video.srcObject = event.streams[0];
+          video.style.display = 'block';
+          fullscreen.hidden = false;
+          video.play().catch(() => { status.textContent = 'Нажмите на видео для запуска'; });
+        };
+        await pc.setRemoteDescription(message.payload);
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        await send(message.from, 'answer', answer);
+      } else if (isSender && message.type === 'answer') {
+        await peers.get(message.from)?.setRemoteDescription(message.payload);
+      } else if (message.type === 'ice') {
+        const pc = peers.get(message.from);
+        if (pc) await pc.addIceCandidate(message.payload).catch(() => {});
+      }
+    }
+
+    async function poll() {
+      try {
+        for (const message of await api(`/api/poll?id=${encodeURIComponent(id)}`)) await handle(message);
+      } catch (error) {
+        status.textContent = error.message;
+      } finally {
+        setTimeout(poll, 500);
+      }
+    }
+
+    async function init() {
+      fullscreen.onclick = () => {
+        if (video.requestFullscreen) video.requestFullscreen();
+        else if (video.webkitEnterFullscreen) video.webkitEnterFullscreen();
+      };
+
+      cast.onclick = async () => {
+        try {
+          if (video.webkitShowPlaybackTargetPicker) video.webkitShowPlaybackTargetPicker();
+          else if (video.remote?.prompt) await video.remote.prompt();
+          else throw new Error('Этот браузер не поддерживает выбор телевизора. Используйте AirPlay/Трансляцию в меню браузера или короткую ссылку /tv.');
+        } catch (error) {
+          status.textContent = error.name === 'NotAllowedError' || /dismissed/i.test(error.message)
+            ? 'Выбор отменён или совместимый телевизор не найден'
+            : `Не удалось подключиться: ${error.message}`;
+        }
+      };
+
+      if (isSender) {
+        const config = await fetch('/api/config').then(r => r.json());
+        token = config.token;
+        tvAddress = config.tvUrls?.[0] || '';
+        start.hidden = false;
+        status.textContent = 'Готово к трансляции';
+        hint.textContent = tvAddress ? `На телевизоре откройте: ${tvAddress}` : 'Откройте на телевизоре адрес /tv, показанный сервером.';
+        start.onclick = async () => {
+          try {
+            stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+            start.hidden = true;
+            const canChooseTv = Boolean(video.webkitShowPlaybackTargetPicker || video.remote?.prompt);
+            cast.hidden = !canChooseTv;
+            video.srcObject = stream;
+            video.muted = true;
+            video.setAttribute('x-webkit-airplay', 'allow');
+            video.style.display = 'block';
+            status.textContent = canChooseTv ? 'Ожидание телевизора или выбор устройства…' : 'Ожидание телевизора…';
+            hint.textContent = `${canChooseTv ? 'Либо откройте' : 'Откройте'} на телевизоре: ${tvAddress || 'адрес /tv, показанный сервером'}`;
+            stream.getVideoTracks()[0].addEventListener('ended', () => location.reload());
+          } catch (error) {
+            status.textContent = error.name === 'NotAllowedError' ? 'Доступ к экрану не предоставлен' : error.message;
+          }
+        };
+      } else {
+        status.textContent = 'Ожидание трансляции…';
+        hint.textContent = 'Не закрывайте эту страницу.';
+        await send('sender', 'join');
+        setInterval(() => { if (![...peers.values()].some(pc => pc.connectionState === 'connected')) send('sender', 'join'); }, 3000);
+      }
+      poll();
+    }
+
+    addEventListener('error', event => { status.textContent = `Ошибка: ${event.message}`; });
+    addEventListener('unhandledrejection', event => { status.textContent = `Ошибка: ${event.reason?.message || event.reason}`; });
+    init().catch(error => { status.textContent = `Ошибка: ${error.message}`; });
+  </script>
+</body>
+</html>
